@@ -576,6 +576,36 @@ pub const Db = struct {
         return Savepoint.init(self, name);
     }
 
+    /// Starts a new transaction with the default DEFERRED behavior.
+    ///
+    /// The returned type is a helper useful for managing commits and rollbacks, for example:
+    ///
+    ///     var transaction = try db.transaction();
+    ///     defer transaction.rollback();
+    ///
+    ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
+    ///
+    ///     transaction.commit();
+    ///
+    pub fn transaction(self: *Self) Transaction.InitError!Transaction {
+        return self.transactionWithBehavior(TransactionBehavior.Deferred);
+    }
+
+    /// Starts a new transaction with the given behavior.
+    ///
+    /// The returned type is a helper useful for managing commits and rollbacks, for example:
+    ///
+    ///     var transaction = try db.transactionWithBehavior(TransactionBehavior.Exclusive);
+    ///     defer transaction.rollback();
+    ///
+    ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
+    ///
+    ///     transaction.commit();
+    ///
+    pub fn transactionWithBehavior(self: *Self, behavior: TransactionBehavior) Transaction.InitError!Transaction {
+        return Transaction.init(self, behavior);
+    }
+
     /// CreateFunctionFlag controls the flags used when creating a custom SQL function.
     /// See https://sqlite.org/c3ref/c_deterministic.html.
     ///
@@ -961,6 +991,101 @@ pub const Savepoint = struct {
         self.commit_stmt.exec(.{}, .{}) catch |err| {
             const detailed_error = self.db.getDetailedError();
             logger.err("unable to release savepoint, error: {}, message: {s}", .{ err, detailed_error });
+        };
+        self.committed = true;
+    }
+
+    pub fn rollback(self: *Self) void {
+        defer {
+            self.commit_stmt.deinit();
+            self.rollback_stmt.deinit();
+        }
+
+        if (self.committed) return;
+
+        self.rollback_stmt.exec(.{}, .{}) catch |err| {
+            const detailed_error = self.db.getDetailedError();
+            std.debug.panic("unable to rollback transaction, error: {}, message: {s}\n", .{ err, detailed_error });
+        };
+    }
+};
+
+/// TransactionBehavior controls the transaction behavior used by `Transaction`.
+///
+/// See https://www.sqlite.org/lang_transaction.html
+const TransactionBehavior = enum {
+    /// Transaction does not actually start until the database is first accessed. Default behavior.
+    Deferred,
+    /// Causes the database connection to start a new write immediately, without waiting for a write statement.
+    /// Might fail with SQLITE_BUSY if another write transaction is already active on another database connection.
+    Immediate,
+    /// Similar to Immediate in that a write transaction is started immediately.
+    /// Exclusive and Immediate are the same in WAL mode, but in other journaling modes, Exclusive prevents
+    /// other database connections from reading the database while the transaction is underway.
+    Exclusive,
+};
+
+/// Transaction is a helper type for managing transactions.
+///
+/// Creates a transaction with BEGIN/COMMIT.
+/// See https://sqlite.org/lang_transaction.html.
+///
+/// You can create a transaction like this:
+///
+///     var transaction = try db.transaction();
+///     defer transaction.rollback();
+///
+///     ...
+///
+///     transaction.commit();
+///
+/// This is equivalent to BEGIN/COMMIT/ROLLBACK.
+///
+pub const Transaction = struct {
+    const Self = @This();
+
+    db: *Db,
+    committed: bool,
+
+    commit_stmt: DynamicStatement,
+    rollback_stmt: DynamicStatement,
+
+    pub const InitError = error{
+        // From execDynamic
+        ExecReturnedData,
+    } || std.fmt.AllocPrintError || Error;
+
+    fn init(db: *Db, behavior: TransactionBehavior) InitError!Self {
+        var buffer: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buffer);
+        var allocator = fba.allocator();
+
+        var behaviorName = switch (behavior) {
+            .Deferred => "DEFERRED",
+            .Immediate => "IMMEDIATE",
+            .Exclusive => "EXCLUSIVE",
+        };
+
+        var res = Self{
+            .db = db,
+            .committed = false,
+            .commit_stmt = try db.prepareDynamic("COMMIT"),
+            .rollback_stmt = try db.prepareDynamic("ROLLBACK"),
+        };
+
+        try res.db.execDynamic(
+            try std.fmt.allocPrint(allocator, "BEGIN {s} TRANSACTION", .{behaviorName}),
+            .{},
+            .{},
+        );
+
+        return res;
+    }
+
+    pub fn commit(self: *Self) void {
+        self.commit_stmt.exec(.{}, .{}) catch |err| {
+            const detailed_error = self.db.getDetailedError();
+            logger.err("unable to commit transaction, error: {}, message: {s}", .{ err, detailed_error });
         };
         self.committed = true;
     }
@@ -3318,6 +3443,82 @@ test "sqlite: two nested savepoints with outer failure" {
         };
 
         savepoint.commit();
+    }
+
+    // The outer transaction failed, expect to have no rows.
+
+    var stmt = try db.prepare("SELECT 1 FROM article");
+    defer stmt.deinit();
+
+    var rows = try stmt.all(usize, allocator, .{}, .{});
+    try testing.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "sqlite: transaction with no failures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var allocator = arena.allocator();
+
+    var db = try getTestDb();
+    defer db.deinit();
+    try addTestData(&db);
+
+    {
+        var transaction = try db.transaction();
+        defer transaction.rollback();
+
+        try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 1, null, true });
+        try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 2, "foobar", true });
+
+        transaction.commit();
+    }
+
+    // No failures, expect to have two rows.
+
+    var stmt = try db.prepare("SELECT data, author_id FROM article ORDER BY id ASC");
+    defer stmt.deinit();
+
+    var rows = try stmt.all(
+        struct {
+            data: []const u8,
+            author_id: usize,
+        },
+        allocator,
+        .{},
+        .{},
+    );
+
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqual(@as(usize, 1), rows[0].author_id);
+    try testing.expectEqualStrings("", rows[0].data);
+    try testing.expectEqual(@as(usize, 2), rows[1].author_id);
+    try testing.expectEqualStrings("foobar", rows[1].data);
+}
+
+test "sqlite: transaction with failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var allocator = arena.allocator();
+
+    var db = try getTestDb();
+    defer db.deinit();
+    try addTestData(&db);
+
+    blk: {
+        var transaction = try db.transaction();
+        defer transaction.rollback();
+
+        var i: usize = 100;
+        while (i < 120) : (i += 1) {
+            try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ i, null, true });
+        }
+
+        // Explicitly fail
+        db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?)", .{}, .{ 2, null }) catch {
+            break :blk;
+        };
+
+        transaction.commit();
     }
 
     // The outer transaction failed, expect to have no rows.
