@@ -940,7 +940,6 @@ pub const Savepoint = struct {
     const Self = @This();
 
     db: *Db,
-    committed: bool,
 
     commit_stmt: DynamicStatement,
     rollback_stmt: DynamicStatement,
@@ -973,7 +972,6 @@ pub const Savepoint = struct {
 
         var res = Self{
             .db = db,
-            .committed = false,
             .commit_stmt = try db.prepareDynamic(commit_query),
             .rollback_stmt = try db.prepareDynamic(rollback_query),
         };
@@ -987,26 +985,17 @@ pub const Savepoint = struct {
         return res;
     }
 
-    pub fn commit(self: *Self) void {
-        self.commit_stmt.exec(.{}, .{}) catch |err| {
-            const detailed_error = self.db.getDetailedError();
-            logger.err("unable to release savepoint, error: {}, message: {s}", .{ err, detailed_error });
-        };
-        self.committed = true;
+    pub fn commit(self: *Self) !void {
+        try self.commit_stmt.exec(.{}, .{});
     }
 
-    pub fn rollback(self: *Self) void {
-        defer {
-            self.commit_stmt.deinit();
-            self.rollback_stmt.deinit();
-        }
+    pub fn rollback(self: *Self) !void {
+        try self.rollback_stmt.exec(.{}, .{});
+    }
 
-        if (self.committed) return;
-
-        self.rollback_stmt.exec(.{}, .{}) catch |err| {
-            const detailed_error = self.db.getDetailedError();
-            std.debug.panic("unable to rollback transaction, error: {}, message: {s}\n", .{ err, detailed_error });
-        };
+    pub fn deinit(self: *Self) void {
+        self.commit_stmt.deinit();
+        self.rollback_stmt.deinit();
     }
 };
 
@@ -1045,7 +1034,6 @@ pub const Transaction = struct {
     const Self = @This();
 
     db: *Db,
-    committed: bool,
 
     commit_stmt: DynamicStatement,
     rollback_stmt: DynamicStatement,
@@ -1068,7 +1056,6 @@ pub const Transaction = struct {
 
         var res = Self{
             .db = db,
-            .committed = false,
             .commit_stmt = try db.prepareDynamic("COMMIT"),
             .rollback_stmt = try db.prepareDynamic("ROLLBACK"),
         };
@@ -1082,26 +1069,17 @@ pub const Transaction = struct {
         return res;
     }
 
-    pub fn commit(self: *Self) void {
-        self.commit_stmt.exec(.{}, .{}) catch |err| {
-            const detailed_error = self.db.getDetailedError();
-            logger.err("unable to commit transaction, error: {}, message: {s}", .{ err, detailed_error });
-        };
-        self.committed = true;
+    pub fn commit(self: *Self) !void {
+        try self.commit_stmt.exec(.{}, .{});
     }
 
-    pub fn rollback(self: *Self) void {
-        defer {
-            self.commit_stmt.deinit();
-            self.rollback_stmt.deinit();
-        }
+    pub fn rollback(self: *Self) !void {
+        try self.rollback_stmt.exec(.{}, .{});
+    }
 
-        if (self.committed) return;
-
-        self.rollback_stmt.exec(.{}, .{}) catch |err| {
-            const detailed_error = self.db.getDetailedError();
-            std.debug.panic("unable to rollback transaction, error: {}, message: {s}\n", .{ err, detailed_error });
-        };
+    pub fn deinit(self: *Self) void {
+        self.commit_stmt.deinit();
+        self.rollback_stmt.deinit();
     }
 };
 
@@ -3330,20 +3308,20 @@ test "sqlite: savepoint with no failures" {
 
     {
         var savepoint = try db.savepoint("outer1");
-        defer savepoint.rollback();
+        defer savepoint.deinit();
 
         try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 1, null, true });
 
         {
             var savepoint2 = try db.savepoint("inner1");
-            defer savepoint2.rollback();
+            defer savepoint2.deinit();
 
             try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 2, "foobar", true });
 
-            savepoint2.commit();
+            try savepoint2.commit();
         }
 
-        savepoint.commit();
+        try savepoint.commit();
     }
 
     // No failures, expect to have two rows.
@@ -3379,25 +3357,26 @@ test "sqlite: two nested savepoints with inner failure" {
 
     {
         var savepoint = try db.savepoint("outer2");
-        defer savepoint.rollback();
+        defer savepoint.deinit();
 
         try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 10, "barbaz", true });
 
         inner: {
             var savepoint2 = try db.savepoint("inner2");
-            defer savepoint2.rollback();
+            defer savepoint2.deinit();
 
             try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 20, null, true });
 
             // Explicitly fail
             db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?)", .{}, .{ 22, null }) catch {
+                try savepoint2.rollback();
                 break :inner;
             };
 
-            savepoint2.commit();
+            try savepoint2.commit();
         }
 
-        savepoint.commit();
+        try savepoint.commit();
     }
 
     // The inner transaction failed, expect to have only one row.
@@ -3430,7 +3409,7 @@ test "sqlite: two nested savepoints with outer failure" {
 
     blk: {
         var savepoint = try db.savepoint("outer3");
-        defer savepoint.rollback();
+        defer savepoint.deinit();
 
         var i: usize = 100;
         while (i < 120) : (i += 1) {
@@ -3439,10 +3418,11 @@ test "sqlite: two nested savepoints with outer failure" {
 
         // Explicitly fail
         db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?)", .{}, .{ 2, null }) catch {
+            try savepoint.rollback();
             break :blk;
         };
 
-        savepoint.commit();
+        try savepoint.commit();
     }
 
     // The outer transaction failed, expect to have no rows.
@@ -3465,12 +3445,12 @@ test "sqlite: transaction with no failures" {
 
     {
         var transaction = try db.transaction();
-        defer transaction.rollback();
+        defer transaction.deinit();
 
         try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 1, null, true });
         try db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?, ?)", .{}, .{ 2, "foobar", true });
 
-        transaction.commit();
+        try transaction.commit();
     }
 
     // No failures, expect to have two rows.
@@ -3506,7 +3486,7 @@ test "sqlite: transaction with failure" {
 
     blk: {
         var transaction = try db.transaction();
-        defer transaction.rollback();
+        defer transaction.deinit();
 
         var i: usize = 100;
         while (i < 120) : (i += 1) {
@@ -3515,13 +3495,14 @@ test "sqlite: transaction with failure" {
 
         // Explicitly fail
         db.exec("INSERT INTO article(author_id, data, is_published) VALUES(?, ?)", .{}, .{ 2, null }) catch {
+            try transaction.rollback();
             break :blk;
         };
 
-        transaction.commit();
+        try transaction.commit();
     }
 
-    // The outer transaction failed, expect to have no rows.
+    // The transaction failed, expect to have no rows.
 
     var stmt = try db.prepare("SELECT 1 FROM article");
     defer stmt.deinit();
