@@ -566,11 +566,11 @@ pub const Db = struct {
     /// The returned type is a helper useful for managing commits and rollbacks, for example:
     ///
     ///     var savepoint = try db.savepoint("foobar");
-    ///     defer savepoint.rollback();
+    ///     defer savepoint.deinit();
     ///
     ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
     ///
-    ///     savepoint.commit();
+    ///     try savepoint.commit();
     ///
     pub fn savepoint(self: *Self, name: []const u8) Savepoint.InitError!Savepoint {
         return Savepoint.init(self, name);
@@ -581,11 +581,11 @@ pub const Db = struct {
     /// The returned type is a helper useful for managing commits and rollbacks, for example:
     ///
     ///     var transaction = try db.transaction();
-    ///     defer transaction.rollback();
+    ///     defer transaction.deinit();
     ///
     ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
     ///
-    ///     transaction.commit();
+    ///     try transaction.commit();
     ///
     pub fn transaction(self: *Self) Transaction.InitError!Transaction {
         return self.transactionWithBehavior(TransactionBehavior.Deferred);
@@ -596,11 +596,11 @@ pub const Db = struct {
     /// The returned type is a helper useful for managing commits and rollbacks, for example:
     ///
     ///     var transaction = try db.transactionWithBehavior(TransactionBehavior.Exclusive);
-    ///     defer transaction.rollback();
+    ///     defer transaction.deinit();
     ///
     ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
     ///
-    ///     transaction.commit();
+    ///     try transaction.commit();
     ///
     pub fn transactionWithBehavior(self: *Self, behavior: TransactionBehavior) Transaction.InitError!Transaction {
         return Transaction.init(self, behavior);
@@ -903,36 +903,46 @@ pub const FunctionContext = struct {
 /// You can create a savepoint like this:
 ///
 ///     var savepoint = try db.savepoint("foobar");
-///     defer savepoint.rollback();
+///     defer savepoint.deinit();
 ///
 ///     ...
 ///
-///     Savepoint.commit();
+///     try savepoint.commit();
 ///
 /// This is equivalent to BEGIN/COMMIT/ROLLBACK.
 ///
 /// Savepoints are more useful for _nesting_ transactions, for example:
 ///
 ///     var savepoint = try db.savepoint("outer");
-///     defer savepoint.rollback();
+///     defer savepoint.deinit();
 ///
 ///     try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 1, "foo" });
 ///
 ///     {
 ///         var savepoint2 = try db.savepoint("inner");
-///         defer savepoint2.rollback();
+///         defer savepoint2.deinit();
 ///
 ///         var i: usize = 0;
 ///         while (i < 30) : (i += 1) {
-///             try db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 2, "bar" });
+///             db.exec("INSERT INTO foo(id, name) VALUES(?, ?)", .{ 2, "bar" }) catch |ierr| {
+///                 const insert_error = db.getDetailedError();
+///                 std.debug.print("unable to insert data into foo, error: {}, message: {s}", .{ ierr, insert_error });
+///                 savepoint2.rollback() catch |rerr| {
+///                     const rollback_error = db.getDetailedError();
+///                     std.debug.print("unable to rollback inner transaction, error: {}, message: {s}", .{ rerr, rollback_error });
+///                 };
+///             };
 ///         }
 ///
-///         savepoint2.commit();
+///         savepoint2.commit() catch |cerr| {
+///             const commit_error = db.getDetailedError();
+///             std.debug.print("failed to commit inner transaction, error: {}, message: {s}", .{ cerr, commit_error });
+///         };
 ///     }
 ///
 ///     try db.exec("UPDATE bar SET processed = ? WHERE id = ?", .{ true, 20 });
 ///
-///     savepoint.commit();
+///     try savepoint.commit();
 ///
 /// In this example if any query in the inner transaction fail, all previously executed queries are discarded but the outer transaction is untouched.
 ///
@@ -1022,11 +1032,11 @@ const TransactionBehavior = enum {
 /// You can create a transaction like this:
 ///
 ///     var transaction = try db.transaction();
-///     defer transaction.rollback();
+///     defer transaction.deinit();
 ///
 ///     ...
 ///
-///     transaction.commit();
+///     try transaction.commit();
 ///
 /// This is equivalent to BEGIN/COMMIT/ROLLBACK.
 ///
