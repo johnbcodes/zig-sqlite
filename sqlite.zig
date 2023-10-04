@@ -1012,7 +1012,7 @@ pub const Savepoint = struct {
 /// TransactionBehavior controls the transaction behavior used by `Transaction`.
 ///
 /// See https://www.sqlite.org/lang_transaction.html
-const TransactionBehavior = enum {
+pub const TransactionBehavior = enum {
     /// Transaction does not actually start until the database is first accessed. Default behavior.
     Deferred,
     /// Causes the database connection to start a new write immediately, without waiting for a write statement.
